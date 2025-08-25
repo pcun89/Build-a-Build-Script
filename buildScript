@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+A lightweight Python build script to automate common dev tasks:
+- clean: remove build artifacts
+- format: run Black
+- lint: run Ruff (or Flake8 if Ruff missing)
+- test: run pytest
+- build: build wheel/sdist using `python -m build`
+- serve: static HTTP server for a folder (default: dist/)
+- dev: watch src/ and tests/ to auto-run test & lint on change
+
+Usage examples:
+    python build.py format
+    python build.py lint
+    python build.py test
+    python build.py build
+    python build.py clean
+    python build.py serve --root dist --port 5173
+    python build.py dev --paths src tests
+"""
+
+import argparse
+import http.server
+import os
+import shutil
+import socketserver
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# -------- Utilities -------- #
+
+def runCmd(cmd: List[str]) -> int:
+    """Run a shell command and stream output; return exit code."""
+    print(f"[run] {' '.join(cmd)}")
+    return subprocess.run(cmd, check=False).returncode
+
+def ensureTool(tool: str, installHint: str = "") -> None:
+    """Warn if a required tool is missing."""
+    if shutil.which(tool) is None:
+        hint = f"  -> {installHint}" if installHint else ""
+        print(f"[warn] `{tool}` not found on PATH.{hint}")
+
+def rmTree(path: Path) -> None:
+    """Remove a directory tree if it exists."""
+    if path.exists():
+        shutil.rmtree(path)
+        print(f"[clean] removed {path}")
+
+# -------- Tasks -------- #
+
+def clean(args: argparse.Namespace) -> int:
+    """Remove common Python build artifacts."""
+    targets = ["build", "dist", ".pytest_cache", ".ruff_cache", ".mypy_cache"]
+    for t in targets:
+        rmTree(Path(t))
+
+    # Remove *.egg-info
+    for p in Path(".").glob("*.egg-info"):
+        rmTree(p)
+
+    # Bytecode
+    for p in Path(".").rglob("__pycache__"):
+        rmTree(p)
+
+    print("[clean] done")
+    return 0
+
+def formatCode(args: argparse.Namespace) -> int:
+    """Run black code formatter."""
+    ensureTool("black", "pip install black")
+    paths = args.paths or ["."]
+    return runCmd([sys.executable, "-m", "black", *paths])
+
+def lint(args: argparse.Namespace) -> int:
+    """Run Ruff (fallback to Flake8 if Ruff not available)."""
+    if shutil.which("ruff"):
+        ensureTool("ruff", "pip install ruff")
+        paths = args.paths or ["."]
+        return runCmd(["ruff", "check", *paths])
+    else:
+        ensureTool("flake8", "pip install flake8")
+        paths = args.paths or ["."]
+        return runCmd(["flake8", *paths])
+
+def test(args: argparse.Namespace) -> int:
+    """Run pytest test suite."""
+    ensureTool("pytest", "pip install pytest")
+    extra = args.pytestArgs or []
+    return runCmd([sys.executable, "-m", "pytest", *extra])
+
+def buildPkg(args: argparse.Namespace) -> int:
+    """Build sdist and wheel via PEP 517/518 (`python -m build`)."""
+    ensureTool("python", "you already have it :)")
+    ensureTool("pip", "python -m ensurepip --upgrade")
+    # Ensure `build` module exists
+    runCmd([sys.executable, "-m", "pip", "install", "--quiet", "build"])
+    return runCmd([sys.executable, "-m", "build"])
+
+def serve(args: argparse.Namespace) -> int:
+    """Serve a static folder via the stdlib http.server."""
+    root = Path(args.root).resolve()
+    if not root.exists():
+        print(f"[serve] root not found: {root}")
+        return 1
+
+    os.chdir(root)
+    handler = http.server.SimpleHTTPRequestHandler
+    port = args.port
+
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        url = f"http://localhost:{port}"
+        print(f"[serve] serving {root} at {url} (Ctrl+C to stop)")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[serve] stopped")
+    return 0
+
+def computeSnapshot(paths: List[Path]) -> Dict[Path, float]:
+    """
+    Compute a snapshot map of file -> last modified time (mtime).
+    Only includes files with typical Python source extensions.
+    """
+    snapshot: Dict[Path, float] = {}
+    exts = {".py", ".pyi"}
+    for base in paths:
+        if base.is_file() and base.suffix in exts:
+            snapshot[base] = base.stat().st_mtime_ns
+        elif base.is_dir():
+            for f in base.rglob("*"):
+                if f.is_file() and f.suffix in exts:
+                    snapshot[f] = f.stat().st_mtime_ns
+    return snapshot
+
+def diffSnapshots(old: Dict[Path, float], new: Dict[Path, float]) -> List[Path]:
+    """Return list of files that were added/changed/removed."""
+    changed: List[Path] = []
+    oldKeys = set(old.keys())
+    newKeys = set(new.keys())
+
+    # Added or removed
+    changed.extend(list(newKeys - oldKeys))
+    changed.extend(list(oldKeys - newKeys))
+
+    # Modified
+    for f in oldKeys & newKeys:
+        if old[f] != new[f]:
+            changed.append(f)
+
+    # Sort for stable output
+    changed.sort()
+    return changed
+
+def dev(args: argparse.Namespace) -> int:
+    """
+    Watch given paths and run `lint` + `test` on changes.
+    Uses a simple polling loop (no external deps).
+    """
+    watchPaths = [Path(p) for p in (args.paths or ["src", "tests"])]
+    interval = args.interval
+
+    print(f"[dev] watching: {', '.join(str(p) for p in watchPaths)} (interval={interval}s)")
+    snapshot = computeSnapshot(watchPaths)
+
+    # Initial run
+    print("[dev] initial check: lint + test")
+    if lint(argparse.Namespace(paths=watchPaths)) != 0:
+        print("[dev] lint failed")
+    if test(argparse.Namespace(pytestArgs=[])) != 0:
+        print("[dev] tests failed")
+
+    try:
+        while True:
+            time.sleep(interval)
+            newSnap = computeSnapshot(watchPaths)
+            changed = diffSnapshots(snapshot, newSnap)
+            if changed:
+                print(f"[dev] detected changes in {len(changed)} file(s):")
+                for f in changed[:10]:
+                    print(f"       - {f}")
+                if len(changed) > 10:
+                    print("       ...")
+
+                # Run tasks on change
+                lint(argparse.Namespace(paths=watchPaths))
+                test(argparse.Namespace(pytestArgs=[]))
+                snapshot = newSnap
+    except KeyboardInterrupt:
+        print("\n[dev] stopped")
+    return 0
+
+# -------- CLI wiring -------- #
+
+def buildParser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Python build script")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("clean", help="Remove build artifacts")
+
+    p_fmt = sub.add_parser("format", help="Run Black")
+    p_fmt.add_argument("--paths", nargs="*", default=None, help="Paths to format")
+
+    p_lint = sub.add_parser("lint", help="Run Ruff or Flake8")
+    p_lint.add_argument("--paths", nargs="*", default=None, help="Paths to lint")
+
+    p_test = sub.add_parser("test", help="Run pytest")
+    p_test.add_argument("pytestArgs", nargs="*", help="Extra args for pytest")
+
+    sub.add_parser("build", help="Build sdist/wheel via `python -m build`")
+
+    p_serve = sub.add_parser("serve", help="Serve a static folder")
+    p_serve.add_argument("--root", default="dist", help="Folder to serve (default: dist)")
+    p_serve.add_argument("--port", type=int, default=5173, help="Port (default: 5173)")
+
+    p_dev = sub.add_parser("dev", help="Watch and run lint+test on changes")
+    p_dev.add_argument("--paths", nargs="*", default=None, help="Paths to watch (default: src tests)")
+    p_dev.add_argument("--interval", type=float, default=0.75, help="Polling interval seconds")
+
+    return parser
+
+def main() -> int:
+    parser = buildParser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "clean": clean,
+        "format": formatCode,
+        "lint": lint,
+        "test": test,
+        "build": buildPkg,
+        "serve": serve,
+        "dev": dev,
+    }
+
+    return dispatch[args.cmd](args)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
